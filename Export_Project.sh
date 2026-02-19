@@ -18,6 +18,7 @@ find . -type f \
         -name "*.yaml" -o \
         -name "*.txt" -o \
         -name "*.md" -o \
+        -name "*.sh" -o \
         -name "Dockerfile" \
     \) \
     ! -name "$OUTPUT" \
