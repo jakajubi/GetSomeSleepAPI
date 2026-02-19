@@ -1,0 +1,661 @@
+   
+   
+   
+############################################################
+# app/__init__.py
+############################################################
+#empty
+   
+   
+   
+############################################################
+# app/init.py
+############################################################
+# app/__init__.py
+   
+   
+   
+############################################################
+# app/main.py
+############################################################
+from flask import Flask, jsonify, request
+from tasks import celery_app, get_some_sleep
+from utils import get_ram_usage_mb, get_storage_usage_mb
+from flasgger import Swagger
+from tasks import get_some_sleep
+import redis
+from celery.result import AsyncResult
+
+app = Flask(__name__)
+#celery_app = Celery('main', broker='redis://redis:6379/0', backend='redis://redis:6379/1')
+
+# Optional configuration (must be set BEFORE Swagger(app))
+app.config['SWAGGER'] = {
+    'title': 'GetSomeSleep API',
+    'uiversion': 3
+}
+
+# Initialize Swagger
+swagger = Swagger(app)
+
+# --------------------------------------------------
+# --- API endpoint GetAPIStatus() - a GET method ---
+# --------------------------------------------------
+@app.route("/GetAPIStatus", methods=["GET"])
+def get_api_status():
+    """
+    Get API status
+    ---
+    tags:
+      - Status
+    responses:
+      200:
+        description: API statistics including queue, workers, and finished tasks
+    """
+    # --- Inspect running tasks ---
+    inspector = celery_app.control.inspect()
+    active = inspector.active() or {}
+    scheduled = inspector.scheduled() or {}
+    reserved = inspector.reserved() or {}
+
+    num_active_tasks = sum(len(active.get(worker, [])) for worker in active)
+    num_scheduled_tasks = sum(len(scheduled.get(worker, [])) for worker in scheduled)
+    num_reserved_tasks = sum(len(reserved.get(worker, [])) for worker in reserved)
+
+    # --- Count tasks in Redis queue (db=0) ---
+    r_queue = redis.Redis(host="redis", port=6379, db=0)
+    num_tasks_in_queue = r_queue.llen("celery")
+
+    # --- Count finished tasks in result backend (db=1) ---
+    r_backend = redis.Redis(host="redis", port=6379, db=1)
+    finished_keys = r_backend.keys("celery-task-meta-*")
+    num_tasks_finished = len(finished_keys)
+
+    # --- Resource usage ---
+    ram_used_mb = get_ram_usage_mb()
+    storage_used_mb = get_storage_usage_mb()
+
+    return jsonify({
+        "tasks": {
+            "in_queue": num_tasks_in_queue,
+            "active": num_active_tasks,
+            "scheduled": num_scheduled_tasks,
+            "reserved": num_reserved_tasks,
+            "finished": num_tasks_finished
+        },
+        "resources": {
+            "ram_used_mb": ram_used_mb,
+            "storage_used_mb": storage_used_mb
+        }
+    })
+
+# ---------------------------------------------------
+# --- API endpoint GetSomeSleep() - a POST method ---
+# ---------------------------------------------------
+@app.route("/GetSomeSleep", methods=["POST"])
+def get_some_sleep_endpoint():
+    """
+    Trigger a sleep task
+    ---
+    tags:
+      - Sleep
+    parameters:
+      - name: body
+        in: body
+        required: true
+        schema:
+          type: object
+          properties:
+            inNumberOfSleepSeconds:
+              type: integer
+              example: 5
+    responses:
+      200:
+        description: Task result
+        schema:
+          type: object
+          properties:
+            sleep_seconds:
+              type: integer
+            quality:
+              type: integer
+    """
+    data = request.get_json(force=True)  # ensures JSON is parsed
+    if "sleep_seconds" not in data:
+        return jsonify({"error": "sleep_seconds is required"}), 400
+    sleep_seconds = int(data["sleep_seconds"])
+    task = get_some_sleep.delay(sleep_seconds)
+    return jsonify({"task_id": task.id})
+
+# ---------------------------------------------------
+# --- API endpoint GetTaskResult() - a GET method ---
+# ---------------------------------------------------
+@app.route("/GetTaskResult/<task_id>", methods=["GET"])
+def get_task_result(task_id):
+    """
+    Get task result by task ID
+    ---
+    tags:
+      - Tasks
+    parameters:
+      - name: task_id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: The Celery task ID returned when the task was created
+    responses:
+      200:
+        description: Task completed successfully
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                state:
+                  type: string
+                  example: SUCCESS
+                result:
+                  type: object
+                  properties:
+                    sleep_seconds:
+                      type: integer
+                      example: 3
+                    quality:
+                      type: integer
+                      example: 8
+      202:
+        description: Task not finished yet
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                state:
+                  type: string
+                  example: PENDING
+    """
+    from celery.result import AsyncResult
+    from tasks import celery_app
+
+    result = AsyncResult(task_id, app=celery_app)
+
+    if result.state == "PENDING":
+        return jsonify({"state": result.state}), 202
+
+    if result.state == "SUCCESS":
+        return jsonify({
+            "state": result.state,
+            "result": result.result
+        })
+
+    return jsonify({"state": result.state}), 202
+
+
+if __name__ == "__main__":
+    # By default, Flask listens on 127.0.0.1 (localhost). 
+    # For other devices to access it, bind to 0.0.0.0
+    # If using Docker, the ports: "5000:5000" mapping handles this for you, 
+    # so the container listens externally on port 5000
+    app.run(host="0.0.0.0", port=5000)
+
+   
+   
+   
+############################################################
+# app/tasks.py
+############################################################
+from celery import Celery
+import random
+import time
+from time import sleep
+
+# Broker role: Queue tasks.
+#     When you call get_some_sleep.delay(5), Celery does not run the task immediately.
+#     Instead, it serializes the task message (function name + arguments) and pushes it into Redis.
+
+# Workers role: 
+#     Celery workers subscribe to Redis and pull tasks from the queue.
+
+# Workflow:
+#     1. Flask receives POST /GetSomeSleep → calls get_some_sleep.delay(5)
+#     2. Celery pushes the task message to Redis (broker)
+#     3. One of your Celery workers pulls the task from Redis
+#     4. Worker executes time.sleep(5) and computes a random quality
+#     5. Result is stored in Redis (result backend)
+#     6. Flask /GetTaskResult/<task_id> can fetch it via AsyncResult(task_id).result ==> returns JSON
+
+celery_app = Celery(
+    "tasks",
+    broker="redis://redis:6379/0", # Redis as the message broker, Task messages go to DB 0
+    backend="redis://redis:6379/1" # Redis also as the result backend (optional), Task results go to DB 1
+)
+
+@celery_app.task(bind=True)
+def get_some_sleep(self, sleep_seconds: int):
+    time.sleep(sleep_seconds)
+    quality = random.randint(1, 10)
+    return {"sleep_seconds": sleep_seconds, "quality": quality}
+
+   
+   
+   
+############################################################
+# app/utils.py
+############################################################
+import psutil
+
+def get_ram_usage_mb():
+    mem = psutil.virtual_memory()
+    return round(mem.used / 1024 / 1024, 2)
+
+def get_storage_usage_mb():
+    disk = psutil.disk_usage('/')
+    return round(disk.used / 1024 / 1024, 2)
+
+   
+   
+   
+############################################################
+# docker-compose.prod.yml
+############################################################
+# This sets up Flask, Celery workers, and Redis for production-style usage 
+# on my Ubuntu laptop, with detached mode, auto-restart, and proper port exposure
+#
+# 0. Open an xterm and go to the folder:
+#     cd ~/Documents/Programming/20260216_GetSomeSleepAPI
+#     source .venv/bin/activate
+#     sudo usermod -aG docker $USER
+#     newgrp docker
+#     docker ps
+#     docker-compose down --rmi all --volumes --remove-orphans
+#     docker system prune -af
+#
+# 1. Build and start containers in detached mode:
+#     docker-compose -f docker-compose.prod.yml up -d --build
+#     docker-compose up
+#
+# 2. Check logs (optional):
+#     docker-compose -f docker-compose.prod.yml logs -f flask_api
+#     docker-compose -f docker-compose.prod.yml logs -f celery_worker
+#
+# 3. Find the laptop’s local IP:
+#     ip address
+#     Example output: 192.168.1.49
+#
+# 4. Allow firewall traffic:
+#     sudo ufw allow 5000/tcp
+#     sudo ufw allow 6379/tcp   # optional, for remote Redis access
+#     sudo ufw status
+#
+# 5. Test from another machine:
+#
+#     curl -X POST http://192.168.1.42:5000/GetSomeSleep \
+#     -H "Content-Type: application/json" \
+#     -d '{"sleep_seconds": 5}'
+#
+#     curl http://192.168.1.42:5000/GetAPIStatus
+#
+# Flask is now accessible to any device on your local network via port 5000.
+# Celery workers will run with 5 concurrent tasks. Adjust --concurrency=5 if needed.
+# Redis DB 0 is for broker, DB 1 is for results.
+# Containers restart automatically if your laptop reboots or a container crashes.
+#
+# 6. To stop everything cleanly:
+#     docker-compose -f docker-compose.prod.yml down
+#
+version: "3.9"
+
+services:
+  flask_api:
+    build: .
+    container_name: flask_api
+    ports:
+      - "5000:5000"  # Expose Flask externally
+    environment:
+      - FLASK_APP=main          # <-- point to your main.py Flask app
+      - FLASK_ENV=development
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    depends_on:
+      - redis
+    restart: unless-stopped
+    command: >
+      bash -c "export FLASK_APP=main && flask run --host=0.0.0.0 --port=5000"
+
+  celery_worker:
+    build: .
+    container_name: celery_worker
+    depends_on:
+      - redis
+      - flask_api
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    restart: unless-stopped
+    command: celery -A main.celery_app worker --loglevel=info --concurrency=5
+
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"  # Expose Redis externally if needed
+    restart: unless-stopped
+
+   
+   
+   
+############################################################
+# docker-compose.yml
+############################################################
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  flask_api:
+    build: .
+    container_name: flask_api
+    volumes:
+      - ./app:/app
+    ports:
+      - "5000:5000"
+    depends_on:
+      - redis
+    environment:
+      - FLASK_ENV=development
+      - PYTHONPATH=/app
+    command: python -u /app/main.py
+
+  celery_worker:
+    build: .
+    container_name: celery_worker
+    volumes:
+      - ./app:/app
+    depends_on:
+      - redis
+    environment:
+      - PYTHONPATH=/app
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=5
+
+   
+   
+   
+############################################################
+# Dockerfile
+############################################################
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY . /app
+
+# Copy all code
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# Set environment variables for Flask
+ENV FLASK_APP=main
+ENV FLASK_ENV=development
+
+# Default command for Flask API
+CMD ["flask", "run", "--host=0.0.0.0", "--port=5000"]
+
+   
+   
+   
+############################################################
+# README.md
+############################################################
+# 1. Open The Project in VS Code
+# ------------------------------
+# Open VS Code.
+# Open the project folder (the folder containing: Dockerfile, docker-compose.yml, requirements.txt, and app/).
+# Make sure Python extension is installed in VS Code.
+# Optional: Install Docker extension for easier container management.
+
+# 2. Configure VS Code environment
+# --------------------------------
+# Since we’re using Docker, you don’t need to install Python packages on your host, 
+# but VS Code can still use a virtual environment for IntelliSense:
+# Create a Python virtual environment (optional for editor features):
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# In VS Code:
+Press Ctrl+Shift+P ==> Python: Select Interpreter → choose .venv/bin/python
+
+# This ensures linting, autocomplete, and Pylance work correctly.
+# First time:
+pip3 install flask celery redis psutil requests flasgger
+
+# 3. Launch Docker containers
+# ---------------------------
+# From the VS Code terminal (or any terminal in the project folder):
+
+# To stop everything
+sudo usermod -aG docker $USER
+newgrp docker
+docker ps
+
+# Clean start (optional first time)
+docker-compose down --rmi all --volumes --remove-orphans
+docker system prune -af
+
+# Build images
+docker-compose build --no-cache
+
+# Start containers
+docker-compose up
+
+# flask_api --> runs on http://localhost:5000
+# celery_worker --> handles async tasks
+# redis --> task broker / backend
+# You’ll see logs for Flask and Celery in the terminal. Keep this terminal open to watch the tasks.
+
+# 4. Test the Flask API
+# ---------------------
+# Endpoint 1: GetAPIStatus
+curl http://localhost:5000/GetAPIStatus
+
+# Example response:
+# {
+#   "tasks_in_queue": 0,
+#   "total_tasks_executed": 3,
+#   "ram_used_mb": 120,
+#   "storage_used_mb": 50
+# }
+
+# Endpoint 2: GetSomeSleep
+curl -X POST http://localhost:5000/GetSomeSleep \
+     -H "Content-Type: application/json" \
+     -d '{"inNumberOfSleepSeconds":5}'
+
+# Example response:
+# {
+#   "sleep_seconds": 5,
+#  "quality": 7
+# }
+
+# This runs a Celery task asynchronously and returns the “quality of sleep” as a random number between 1 and 10.
+
+# 5. Run the test Python program
+# ------------------------------
+# If you have a test program (e.g., launch_tasks.py) that submits multiple sleep tasks and saves results:
+python test_client/launch_tasks.py
+
+# It will push N GetSomeSleep jobs to Celery.
+# Fetch results from Redis.
+# Save all results into a text file (e.g., sleep_results.txt).
+
+# 6. Optional: View logs in VS Code
+---------------------------------
+# Open Docker extension ==> see containers ==> view logs.
+# Or use CLI:
+docker-compose logs -f flask_api
+docker-compose logs -f celery_worker
+
+# 7. Stop the app cleanly
+# -----------------------
+docker-compose down
+# Stops all containers but keeps images unless you add --rmi all.
+
+# 8. Swagger documentation
+# ------------------------
+http://localhost:5000/apidocs
+
+
+   
+   
+   
+############################################################
+# requirements.txt
+############################################################
+Flask>=2.3.0,<2.4
+celery>=5.3.0,<6.0
+redis>=5.3.0,<6.0
+psutil>=5.9.0,<6.0
+requests>=2.32.0,<3.0
+flasgger
+
+   
+   
+   
+############################################################
+# test_client/launch_tasks.py
+############################################################
+import requests
+import random
+import time
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+API_URL = "http://localhost:5000/GetSomeSleep"
+RESULT_URL = "http://localhost:5000/GetTaskResult"
+RESULTS_FILE = "sleep_results.txt"
+
+POLL_INTERVAL = 0.5  # seconds interval
+
+
+def launch_tasks(n):
+    task_ids = []
+
+    print(f"\nLaunching {n} tasks...\n")
+
+    for i in range(n):
+        seconds = random.randint(10, 20)
+
+        response = requests.post(
+            API_URL,
+            json={"sleep_seconds": seconds}
+        )
+
+        response.raise_for_status()
+        task_id = response.json()["task_id"]
+
+        print(f"[{i+1}/{n}] Launched task {task_id} ({seconds}s)")
+        task_ids.append(task_id)
+
+    return task_ids
+
+
+def poll_single_task(task_id):
+    """Poll a single task until it finishes safely."""
+    while True:
+        try:
+            r = requests.get(f"{RESULT_URL}/{task_id}")
+            # print("DEBUG STATUS:", r.status_code, r.text)
+
+            # If server error → retry
+            if r.status_code >= 500:
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            # If task not ready yet (202)
+            if r.status_code == 202:
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            # If not OK → print and stop
+            if r.status_code != 200:
+                return {
+                    "task_id": task_id,
+                    "error": f"Unexpected status {r.status_code}"
+                }
+
+            # Now safe to parse JSON
+            data = r.json()
+
+            if data["state"] == "SUCCESS":
+                return {
+                    "task_id": task_id,
+                    "sleep_seconds": data["result"]["sleep_seconds"],
+                    "quality": data["result"]["quality"]
+                }
+
+        except requests.exceptions.JSONDecodeError:
+            # Response was not JSON (e.g., HTML error page)
+            time.sleep(POLL_INTERVAL)
+
+        except requests.exceptions.RequestException as e:
+            # Network or connection error
+            print(f"Network error for {task_id}: {e}")
+            time.sleep(POLL_INTERVAL)
+
+
+def fetch_results_concurrently(task_ids):
+    results = []
+    total = len(task_ids)
+    completed = 0
+
+    print("\nPolling results concurrently...\n")
+
+    with ThreadPoolExecutor(max_workers=len(task_ids)) as executor:
+        future_to_task = {
+            executor.submit(poll_single_task, task_id): task_id
+            for task_id in task_ids
+        }
+
+        for future in as_completed(future_to_task):
+            result = future.result()
+            results.append(result)
+
+            completed += 1
+            if "error" in result:
+                print(
+                    f"✖ Completed {completed}/{total} "
+                    f"(Task {result['task_id']} → ERROR: {result['error']})"
+                )
+            else:
+                print(
+                    f"✔ Completed {completed}/{total} "
+                    f"(Task {result['task_id']} → "
+                    f"{result['sleep_seconds']}s, quality {result['quality']})"
+                )
+
+    return results
+
+
+if __name__ == "__main__":
+    N = 10
+
+    start_time = time.time()
+
+    task_ids = launch_tasks(N)
+    results = fetch_results_concurrently(task_ids)
+
+    with open(RESULTS_FILE, "w") as f:
+        for r in results:
+            f.write(json.dumps(r) + "\n")
+
+    duration = time.time() - start_time
+
+    print(f"\nAll tasks finished in {duration:.2f} seconds")
+    print(f"Results saved to {RESULTS_FILE}\n")
+

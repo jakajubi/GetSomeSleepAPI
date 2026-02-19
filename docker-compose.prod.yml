@@ -1,0 +1,82 @@
+# This sets up Flask, Celery workers, and Redis for production-style usage 
+# on my Ubuntu laptop, with detached mode, auto-restart, and proper port exposure
+#
+# 0. Open an xterm and go to the folder:
+#     cd ~/Documents/Programming/20260216_GetSomeSleepAPI
+#     source .venv/bin/activate
+#     sudo usermod -aG docker $USER
+#     newgrp docker
+#     docker ps
+#     docker-compose down --rmi all --volumes --remove-orphans
+#     docker system prune -af
+#
+# 1. Build and start containers in detached mode:
+#     docker-compose -f docker-compose.prod.yml up -d --build
+#     docker-compose up
+#
+# 2. Check logs (optional):
+#     docker-compose -f docker-compose.prod.yml logs -f flask_api
+#     docker-compose -f docker-compose.prod.yml logs -f celery_worker
+#
+# 3. Find the laptop’s local IP:
+#     ip address
+#     Example output: 192.168.1.49
+#
+# 4. Allow firewall traffic:
+#     sudo ufw allow 5000/tcp
+#     sudo ufw allow 6379/tcp   # optional, for remote Redis access
+#     sudo ufw status
+#
+# 5. Test from another machine:
+#
+#     curl -X POST http://192.168.1.42:5000/GetSomeSleep \
+#     -H "Content-Type: application/json" \
+#     -d '{"sleep_seconds": 5}'
+#
+#     curl http://192.168.1.42:5000/GetAPIStatus
+#
+# Flask is now accessible to any device on your local network via port 5000.
+# Celery workers will run with 5 concurrent tasks. Adjust --concurrency=5 if needed.
+# Redis DB 0 is for broker, DB 1 is for results.
+# Containers restart automatically if your laptop reboots or a container crashes.
+#
+# 6. To stop everything cleanly:
+#     docker-compose -f docker-compose.prod.yml down
+#
+version: "3.9"
+
+services:
+  flask_api:
+    build: .
+    container_name: flask_api
+    ports:
+      - "5000:5000"  # Expose Flask externally
+    environment:
+      - FLASK_APP=main          # <-- point to your main.py Flask app
+      - FLASK_ENV=development
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    depends_on:
+      - redis
+    restart: unless-stopped
+    command: >
+      bash -c "export FLASK_APP=main && flask run --host=0.0.0.0 --port=5000"
+
+  celery_worker:
+    build: .
+    container_name: celery_worker
+    depends_on:
+      - redis
+      - flask_api
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    restart: unless-stopped
+    command: celery -A main.celery_app worker --loglevel=info --concurrency=5
+
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"  # Expose Redis externally if needed
+    restart: unless-stopped

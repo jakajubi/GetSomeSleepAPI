@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  flask_api:
+    build: .
+    container_name: flask_api
+    volumes:
+      - ./app:/app
+    ports:
+      - "5000:5000"
+    depends_on:
+      - redis
+    environment:
+      - FLASK_ENV=development
+      - PYTHONPATH=/app
+    command: python -u /app/main.py
+
+  celery_worker:
+    build: .
+    container_name: celery_worker
+    volumes:
+      - ./app:/app
+    depends_on:
+      - redis
+    environment:
+      - PYTHONPATH=/app
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=5
