@@ -1,3 +1,8 @@
+#
+# In this file: procedure for DEVELOPMENT
+# Procedure for PRODUCTION, see docker-compose.prod.yml 
+#
+# ------------------------------
 # 1. Open The Project in VS Code
 # ------------------------------
 # Open VS Code.
@@ -32,17 +37,17 @@ newgrp docker
 docker ps
 
 # Clean start (optional first time) - do not use --volumes if you want to save the PostGIS database
-docker-compose down --rmi all --volumes --remove-orphans
-docker-compose down --rmi all --remove-orphans
+docker compose down --rmi all --volumes --remove-orphans
+docker compose down --rmi all --remove-orphans
 
 # removes all unused containers, networks, images, and build cache (By default it does not remove volumes)
 docker system prune -af
 
 # Build images
-docker-compose build --no-cache
+docker compose build --no-cache
 
 # Start containers
-docker-compose up
+docker compose up
 
 # flask_api --> runs on http://localhost:5000
 # celery_worker --> handles async tasks
@@ -88,12 +93,12 @@ python test_client/launch_tasks.py
 ---------------------------------
 # Open Docker extension ==> see containers ==> view logs.
 # Or use CLI:
-docker-compose logs -f flask_api
-docker-compose logs -f celery_worker
+docker compose logs -f flask_api
+docker compose logs -f celery_worker
 
 # 7. Stop the app cleanly
 # -----------------------
-docker-compose down
+docker compose down
 # Stops all containers but keeps images unless you add --rmi all.
 
 # 8. Swagger documentation
