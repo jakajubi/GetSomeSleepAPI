@@ -70,7 +70,7 @@ curl http://localhost:5000/GetAPIStatus
 # Endpoint 2: GetSomeSleep
 curl -X POST http://localhost:5000/GetSomeSleep \
      -H "Content-Type: application/json" \
-     -d '{"inNumberOfSleepSeconds":5}'
+     -d '{"sleep_seconds":5}'
 
 # Example response:
 # {
@@ -110,3 +110,43 @@ http://localhost:5000/apidocs
 docker exec -it postgis_data_dev psql -U sleepuser -d sleepdb
 # display all entries
 SELECT * FROM sleep_results;
+
+# 10. MinIO S3-Compatible Storage Integration
+# -------------------------------------------
+# The API now stores all results both in PostgreSQL and in a CSV file 
+# on MinIO (local S3-compatible storage).
+
+### Features
+# - **Local storage** - No cloud account needed
+# - **CSV format** with timestamp columns (date and time)
+# - **Presigned URLs** for secure downloads
+# - **MinIO Console** for easy file management (http://localhost:9001)
+
+### CSV Format
+# The APIGetSomeSleep_Results.csv file contains:
+# - task_id: Unique identifier for each task
+# - sleep_seconds: Number of seconds slept
+# - quality: Random quality score (1-10)
+# - date: Date when result was generated (YYYY/MM/DD)
+# - time: Time when result was generated (hh:mm:ss)
+
+### S3 API Endpoints
+
+# 1. GET /GetResultsCSV     Returns a presigned URL to download the complete results CSV file.
+curl "http://localhost:5000/GetResultsCSV?expires=7200"
+# Response 
+#    {
+#     "download_url": "http://localhost:9000/api-sleep-results-dev/APIGetSomeSleep_Results.csv?X-Amz-Algorithm=...",
+#     "expires_in_seconds": 7200,
+#     "bucket": "api-sleep-results-dev",
+#     "file": "APIGetSomeSleep_Results.csv"
+#    }
+
+# 2. GET /ListAllResults      Lists all results currently stored in the CSV file.
+curl "http://localhost:5000/ListAllResults"
+
+# MinIO Console Access
+URL: http://localhost:9001
+# Username: minioadmin
+# Password: minioadmin
+# You can view and download the CSV file directly through the MinIO web interface.

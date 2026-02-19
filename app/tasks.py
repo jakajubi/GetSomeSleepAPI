@@ -2,21 +2,22 @@ from celery import Celery
 import random
 import time
 from time import sleep
+from storage import append_result_to_csv, ensure_bucket_exists
 
 # Broker role: Queue tasks.
-#     When you call get_some_sleep.delay(5), Celery does not run the task immediately.
-#     Instead, it serializes the task message (function name + arguments) and pushes it into Redis.
+# When you call get_some_sleep.delay(5), Celery does not run the task immediately.
+# Instead, it serializes the task message (function name + arguments) and pushes it into Redis.
 
 # Workers role: 
-#     Celery workers subscribe to Redis and pull tasks from the queue.
+# Celery workers subscribe to Redis and pull tasks from the queue.
 
 # Workflow:
-#     1. Flask receives POST /GetSomeSleep → calls get_some_sleep.delay(5)
-#     2. Celery pushes the task message to Redis (broker)
-#     3. One of your Celery workers pulls the task from Redis
-#     4. Worker executes time.sleep(5) and computes a random quality
-#     5. Result is stored in Redis (result backend)
-#     6. Flask /GetTaskResult/<task_id> can fetch it via AsyncResult(task_id).result ==> returns JSON
+# 1. Flask receives POST /GetSomeSleep → calls get_some_sleep.delay(5)
+# 2. Celery pushes the task message to Redis (broker)
+# 3. One of your Celery workers pulls the task from Redis
+# 4. Worker executes time.sleep(5) and computes a random quality
+# 5. Result is stored in Redis (result backend)
+# 6. Flask /GetTaskResult/<task_id> can fetch it via AsyncResult(task_id).result ==> returns JSON
 
 celery_app = Celery(
     "tasks",
@@ -26,11 +27,15 @@ celery_app = Celery(
 
 from database import SessionLocal, SleepResult
 
+# Ensure MinIO bucket exists when worker starts
+ensure_bucket_exists()
+
 @celery_app.task(bind=True)
 def get_some_sleep(self, sleep_seconds: int):
     time.sleep(sleep_seconds)
     quality = random.randint(1, 10)
 
+    # Store in PostgreSQL
     db = SessionLocal()
     result = SleepResult(
         sleep_seconds=sleep_seconds,
@@ -38,7 +43,14 @@ def get_some_sleep(self, sleep_seconds: int):
     )
     db.add(result)
     db.commit()
+    
+    # Get the task ID for MinIO storage
+    task_id = self.request.id
+    
+    # Store in MinIO CSV
+    append_result_to_csv(task_id, sleep_seconds, quality)
+    
     db.close()
 
     return {"sleep_seconds": sleep_seconds, "quality": quality}
-
+    

@@ -1,6 +1,4 @@
-#The default YAML file in development
-#version: "3.9"
-
+# The default YAML file in development
 services:
 
   postgis:
@@ -14,21 +12,53 @@ services:
       - "5433:5432" #different exposed port as production: 5433
     volumes:
       - postgis_data_dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sleepuser -d sleepdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:7
     container_name: redis
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"   # API port
+      - "9001:9001"   # Console port
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
 
   flask_api:
     build: .
     container_name: flask_api
     volumes:
-      - ./app:/app  # This is fine now because the script is NOT in /app
+      - ./app:/app
     depends_on:
-      - redis
-      - postgis
+      postgis:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     ports:
       - "5000:5000"
     environment:
@@ -37,7 +67,15 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
       - DATABASE_URL=postgresql://sleepuser:sleeppassword@postgis:5432/sleepdb
-      # No command needed - using CMD from Dockerfile
+      # MinIO Configuration
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin
+      - S3_BUCKET=api-sleep-results-dev
+      - S3_REGION=us-east-1
+    restart: unless-stopped
+    # Use the wait script to ensure PostGIS is ready
+    command: wait-for-postgis.sh postgis python /app/main.py
 
   celery_worker:
     build: .
@@ -45,14 +83,30 @@ services:
     volumes:
       - ./app:/app
     depends_on:
-      - redis
-      - postgis
+      postgis:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     environment:
       - PYTHONPATH=/app
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
       - DATABASE_URL=postgresql://sleepuser:sleeppassword@postgis:5432/sleepdb
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=5
+      # MinIO Configuration
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin
+      - S3_BUCKET=api-sleep-results-dev
+      - S3_REGION=us-east-1
+    restart: unless-stopped
+    command: >
+      bash -c "
+        wait-for-postgis.sh postgis &&
+        celery -A tasks.celery_app worker --loglevel=info --concurrency=5
+      "
 
 volumes:
   postgis_data_dev:
+  minio_data:

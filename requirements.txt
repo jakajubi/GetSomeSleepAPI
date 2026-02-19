@@ -6,3 +6,4 @@ requests==2.32.3
 flasgger==0.9.7.1
 psycopg2-binary==2.9.9
 SQLAlchemy==2.0.29
+boto3==1.34.0  # AWS S3 support

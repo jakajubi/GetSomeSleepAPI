@@ -68,8 +68,7 @@
 # So, the paths themselves are perfectly fine and portable - just make sure your production data is 
 # properly backed up!
 #
-#version: "3.9" #No need of version since using new docker version via "docker compose" instead of "docker-compose"
-
+# docker-compose.prod.yml - Production with MinIO
 services:
 
   postgis:
@@ -102,13 +101,34 @@ services:
       timeout: 5s
       retries: 5
 
+  minio:
+    image: minio/minio:latest
+    container_name: minio_prod
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data_prod:/data
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
   flask_api:
     build: .
-    container_name: flask_api
+    container_name: flask_api_prod
     depends_on:
       postgis:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     ports:
       - "5000:5000"
@@ -119,27 +139,36 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
       - DATABASE_URL=postgresql://sleepuser:sleeppassword@postgis:5432/sleepdb
+      # MinIO Configuration
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - S3_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - S3_BUCKET=api-sleep-results-prod
+      - S3_REGION=us-east-1
     restart: unless-stopped
-    # Run with python directly instead of flask command
     command: wait-for-postgis.sh postgis python /app/main.py
-
 
   celery_worker:
     build: .
-    container_name: celery_worker
+    container_name: celery_worker_prod
     depends_on:
       postgis:
         condition: service_healthy
       redis:
         condition: service_healthy
-      flask_api:
-        condition: service_started
+      minio:
+        condition: service_healthy
     environment:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
       - DATABASE_URL=postgresql://sleepuser:sleeppassword@postgis:5432/sleepdb
+      # MinIO Configuration
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - S3_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - S3_BUCKET=api-sleep-results-prod
+      - S3_REGION=us-east-1
     restart: unless-stopped
-    # Celery worker also needs to wait for PostGIS
     command: >
       bash -c "
         wait-for-postgis.sh postgis &&
@@ -148,3 +177,5 @@ services:
 
 volumes:
   postgis_data_prod:
+  minio_data_prod:
+  

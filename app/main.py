@@ -5,6 +5,7 @@ from flasgger import Swagger
 from tasks import get_some_sleep
 import redis
 from celery.result import AsyncResult
+from storage import get_csv_download_url, ensure_bucket_exists, list_all_results  # Add this import
 
 app = Flask(__name__)
 #celery_app = Celery('main', broker='redis://redis:6379/0', backend='redis://redis:6379/1')
@@ -91,7 +92,7 @@ def get_some_sleep_endpoint():
         schema:
           type: object
           properties:
-            inNumberOfSleepSeconds:
+            sleep_seconds:
               type: integer
               example: 5
     responses:
@@ -175,6 +176,80 @@ def get_task_result(task_id):
         })
 
     return jsonify({"state": result.state}), 202
+
+
+# -------------------------------------------------------
+# --- NEW API endpoint GetResultsCSV() - a GET method ---
+# -------------------------------------------------------
+@app.route("/GetResultsCSV", methods=["GET"])
+def get_results_csv():
+    """
+    Get download URL for the CSV results file from MinIO
+    ---
+    tags:
+      - Results
+    responses:
+      200:
+        description: Presigned URL for CSV download
+        schema:
+          type: object
+          properties:
+            download_url:
+              type: string
+              example: "http://localhost:9000/api-sleep-results/APIGetSomeSleep_Results.csv?X-Amz-Algorithm=..."
+            expires_in_seconds:
+              type: integer
+              example: 3600
+            bucket:
+              type: string
+              example: "api-sleep-results"
+            file:
+              type: string
+              example: "APIGetSomeSleep_Results.csv"
+      404:
+        description: CSV file not found yet
+      500:
+        description: Error generating download URL
+    """
+    # Ensure bucket exists
+    ensure_bucket_exists()
+    
+    # Get expiration from query param (default 1 hour)
+    expiration = request.args.get('expires', default=3600, type=int)
+    
+    # Generate presigned URL
+    url = get_csv_download_url(expiration=expiration)
+    
+    if url:
+        return jsonify({
+            "download_url": url,
+            "expires_in_seconds": expiration,
+            "bucket": "api-sleep-results",
+            "file": "APIGetSomeSleep_Results.csv"
+        })
+    else:
+        return jsonify({"error": "CSV file not found or error generating URL"}), 404
+
+
+# --------------------------------------------------------
+# --- NEW API endpoint ListAllResults() - a GET method ---
+# --------------------------------------------------------
+@app.route("/ListAllResults", methods=["GET"])
+def list_all_results_endpoint():
+    """
+    List all results from the CSV file (for debugging)
+    ---
+    tags:
+      - Results
+    responses:
+      200:
+        description: List of all results
+    """
+    results = list_all_results()
+    return jsonify({
+        "count": len(results),
+        "results": results
+    })
 
 
 if __name__ == "__main__":
