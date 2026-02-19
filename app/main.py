@@ -18,6 +18,11 @@ app.config['SWAGGER'] = {
 # Initialize Swagger
 swagger = Swagger(app)
 
+# PostGIS database containing previous job results
+from database import Base, engine
+Base.metadata.create_all(bind=engine)
+
+
 # --------------------------------------------------
 # --- API endpoint GetAPIStatus() - a GET method ---
 # --------------------------------------------------

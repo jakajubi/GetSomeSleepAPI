@@ -31,8 +31,11 @@ sudo usermod -aG docker $USER
 newgrp docker
 docker ps
 
-# Clean start (optional first time)
+# Clean start (optional first time) - do not use --volumes if you want to save the PostGIS database
 docker-compose down --rmi all --volumes --remove-orphans
+docker-compose down --rmi all --remove-orphans
+
+# removes all unused containers, networks, images, and build cache (By default it does not remove volumes)
 docker system prune -af
 
 # Build images
@@ -97,3 +100,8 @@ docker-compose down
 # ------------------------
 http://localhost:5000/apidocs
 
+# 9. Connect to the PostGIS database
+# ----------------------------------
+docker exec -it postgis_data_dev psql -U sleepuser -d sleepdb
+# display all entries
+SELECT * FROM sleep_results;

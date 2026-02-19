@@ -4,19 +4,21 @@
 # 0. Open an xterm and go to the folder:
 #     cd ~/Documents/Programming/20260216_GetSomeSleepAPI
 #     source .venv/bin/activate
+#     sudo systemctl restart docker
 #     sudo usermod -aG docker $USER
 #     newgrp docker
 #     docker ps
-#     docker-compose down --rmi all --volumes --remove-orphans
+#     docker compose down --rmi all --volumes --remove-orphans
 #     docker system prune -af
+#     Remark: DO NOT USE --volumes if you want to keep the PosGIS DB
 #
 # 1. Build and start containers in detached mode:
-#     docker-compose -f docker-compose.prod.yml up -d --build
-#     docker-compose up
+#     docker compose -f docker-compose.prod.yml up -d --build
 #
 # 2. Check logs (optional):
-#     docker-compose -f docker-compose.prod.yml logs -f flask_api
-#     docker-compose -f docker-compose.prod.yml logs -f celery_worker
+#     docker compose -f docker-compose.prod.yml logs -f flask_api
+#     docker compose -f docker-compose.prod.yml logs -f celery_worker
+#     docker compose -f docker-compose.prod.yml logs -f redis
 #
 # 3. Find the laptop’s local IP:
 #     ip address
@@ -41,42 +43,108 @@
 # Containers restart automatically if your laptop reboots or a container crashes.
 #
 # 6. To stop everything cleanly:
-#     docker-compose -f docker-compose.prod.yml down
+#     docker compose -f docker-compose.prod.yml down
 #
-version: "3.9"
+#
+# The absolute paths in this file are actually container-internal paths, not host machine paths, 
+# which makes them fully portable across any cloud server. Here's why this works perfectly for 
+# deployment:
+# The paths like /var/lib/postgresql/data are inside the container - they're the standard locations 
+# where PostgreSQL expects to find its data files, regardless  of what operating system or cloud 
+# provider you're using. When you define volumes like postgis_data_prod:/var/lib/postgresql/data, 
+# Docker creates a persistent volume that maps to some location on your host machine (like 
+# /var/lib/docker/volumes/...), but your application never needs to know or care about that host path. 
+# This abstraction means you can deploy the exact same docker-compose.prod.yml file on any cloud 
+# server (AWS EC2, etc.) without changing a single path - the containers will always find their data 
+# at /var/lib/postgresql/data internally, and Docker manages the host storage behind the scenes.
+#
+# The real consideration for cloud deployment isn't the paths themselves, but rather data persistence 
+# and backup strategies. When you deploy to a cloud server, those Docker volumes live on that server's 
+# local disk. If the server crashes or gets terminated, you could lose your data unless you've 
+# implemented proper backups. For production cloud deployments, you'll want to either:
+#     - Use cloud-managed database services (like AWS RDS for PostgreSQL) instead of containerized databases
+#     - Set up regular volume backups to cloud storage (S3, etc.)
+#     - Use cloud volume drivers that store Docker volumes on persistent network storage (like EBS on AWS)
+# So, the paths themselves are perfectly fine and portable - just make sure your production data is 
+# properly backed up!
+#
+#version: "3.9" #No need of version since using new docker version via "docker compose" instead of "docker-compose"
 
 services:
-  flask_api:
-    build: .
-    container_name: flask_api
-    ports:
-      - "5000:5000"  # Expose Flask externally
-    environment:
-      - FLASK_APP=main          # <-- point to your main.py Flask app
-      - FLASK_ENV=development
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/1
-    depends_on:
-      - redis
-    restart: unless-stopped
-    command: >
-      bash -c "export FLASK_APP=main && flask run --host=0.0.0.0 --port=5000"
 
-  celery_worker:
-    build: .
-    container_name: celery_worker
-    depends_on:
-      - redis
-      - flask_api
+  postgis:
+    image: postgis/postgis:16-3.4
+    container_name: postgis_data_prod
     environment:
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      POSTGRES_DB: sleepdb
+      POSTGRES_USER: sleepuser
+      POSTGRES_PASSWORD: sleeppassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgis_data_prod:/var/lib/postgresql/data
     restart: unless-stopped
-    command: celery -A main.celery_app worker --loglevel=info --concurrency=5
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sleepuser -d sleepdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:7
     container_name: redis
     ports:
-      - "6379:6379"  # Expose Redis externally if needed
+      - "6379:6379"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  flask_api:
+    build: .
+    container_name: flask_api
+    depends_on:
+      postgis:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_APP=main
+      - FLASK_ENV=production
+      - PYTHONPATH=/app
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - DATABASE_URL=postgresql://sleepuser:sleeppassword@postgis:5432/sleepdb
+    restart: unless-stopped
+    # Run with python directly instead of flask command
+    command: wait-for-postgis.sh postgis python /app/main.py
+
+
+  celery_worker:
+    build: .
+    container_name: celery_worker
+    depends_on:
+      postgis:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      flask_api:
+        condition: service_started
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - DATABASE_URL=postgresql://sleepuser:sleeppassword@postgis:5432/sleepdb
+    restart: unless-stopped
+    # Celery worker also needs to wait for PostGIS
+    command: >
+      bash -c "
+        wait-for-postgis.sh postgis &&
+        celery -A tasks.celery_app worker --loglevel=info --concurrency=5
+      "
+
+volumes:
+  postgis_data_prod:

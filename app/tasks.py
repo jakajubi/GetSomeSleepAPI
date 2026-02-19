@@ -24,8 +24,21 @@ celery_app = Celery(
     backend="redis://redis:6379/1" # Redis also as the result backend (optional), Task results go to DB 1
 )
 
+from database import SessionLocal, SleepResult
+
 @celery_app.task(bind=True)
 def get_some_sleep(self, sleep_seconds: int):
     time.sleep(sleep_seconds)
     quality = random.randint(1, 10)
+
+    db = SessionLocal()
+    result = SleepResult(
+        sleep_seconds=sleep_seconds,
+        quality=quality
+    )
+    db.add(result)
+    db.commit()
+    db.close()
+
     return {"sleep_seconds": sleep_seconds, "quality": quality}
+
